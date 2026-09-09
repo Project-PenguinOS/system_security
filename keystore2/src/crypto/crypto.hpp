@@ -67,23 +67,39 @@ extern "C" {
 // Parse a DER-encoded X.509 certificate contained in cert_buf, with length
 // cert_len, extract the subject, DER-encode it and write the result to
 // subject_buf, which has subject_buf_len capacity.
-//
-// Because the length of the subject is unknown, and because we'd like to (a) be
-// able to handle subjects of any size and (b) avoid parsing the certificate
-// twice most of the time, once to discover the length and once to parse it, the
-// return value is overloaded.
-//
-// If the return value > 0 it specifies the number of bytes written into
-// subject_buf; the operation was successful.
-//
-// If the return value == 0, certificate parsing failed unrecoverably.  The
-// reason will be logged.
-//
-// If the return value < 0, the operation failed because the subject size >
-// subject_buf_len.  The return value is -(subject_size), where subject_size is
-// the size of the extracted DER-encoded subject field.  Call
-// extractSubjectFromCertificate again with a sufficiently-large buffer.
 int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len,
                                   uint8_t* subject_buf, size_t subject_buf_len);
+
+// Parse a DER-encoded X.509 certificate contained in cert_buf, with length
+// cert_len, extract the issuer, DER-encode it and write the result to
+// issuer_buf, which has issuer_buf_len capacity.
+int extractIssuerFromCertificate(const uint8_t* cert_buf, size_t cert_len,
+                                 uint8_t* issuer_buf, size_t issuer_buf_len);
+
+// Verify that `child_cert_buf` is signed by `parent_cert_buf` public key.
+bool verifyCertificateSignedBy(const uint8_t* child_cert_buf, size_t child_cert_len,
+                               const uint8_t* parent_cert_buf, size_t parent_cert_len);
+
+// Return signature key family used by certificate's signature algorithm:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificateSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Return public key family of certificate SubjectPublicKeyInfo:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificatePublicKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Return signature key family encoded in TBSCertificate.signature field:
+// - 1: RSA
+// - 2: EC/ECDSA
+// - 0: unknown or parse failure
+int getCertificateTbsSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len);
+
+// Extract patch levels from Android attestation extension (OID 1.3.6.1.4.1.11129.2.1.17).
+int extractAttestationPatchLevels(const uint8_t* cert_buf, size_t cert_len, int32_t* out_os_patchlevel,
+                                  int32_t* out_vendor_patchlevel, int32_t* out_boot_patchlevel);
 
 #endif  //  __CRYPTO_H__

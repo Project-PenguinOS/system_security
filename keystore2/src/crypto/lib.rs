@@ -19,10 +19,15 @@ mod error;
 pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
-    extractSubjectFromCertificate, hmacSha256, randomBytes, AES_gcm_decrypt, AES_gcm_encrypt,
+    extractAttestationPatchLevels, extractIssuerFromCertificate, extractSubjectFromCertificate,
+    hmacSha256, randomBytes,
+    AES_gcm_decrypt, AES_gcm_encrypt,
+    getCertificatePublicKeyFamily, getCertificateSignatureKeyFamily,
+    getCertificateTbsSignatureKeyFamily,
     ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey, ECKEYParsePrivateKey,
     ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free,
-    HKDFExpand, HKDFExtract, EC_KEY, EC_POINT, EVP_MAX_MD_SIZE, PBKDF2,
+    HKDFExpand, HKDFExtract, PBKDF2, verifyCertificateSignedBy, EC_KEY,
+    EC_POINT, EVP_MAX_MD_SIZE,
 };
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -501,6 +506,134 @@ pub fn parse_subject_from_certificate(cert_buf: &[u8]) -> Result<Vec<u8>, Error>
     retval.truncate(safe_size);
 
     Ok(retval)
+}
+
+/// Uses BoringSSL to extract the DER-encoded issuer from a DER-encoded X.509 certificate.
+pub fn parse_issuer_from_certificate(cert_buf: &[u8]) -> Result<Vec<u8>, Error> {
+    // Try with a 200-byte output buffer, should be enough in all but bizarre cases.
+    let mut retval = vec![0; 200];
+
+    // Safety: extractIssuerFromCertificate reads at most cert_buf.len() bytes from cert_buf and
+    // writes at most retval.len() bytes to retval.
+    let mut size = unsafe {
+        extractIssuerFromCertificate(
+            cert_buf.as_ptr(),
+            cert_buf.len(),
+            retval.as_mut_ptr(),
+            retval.len(),
+        )
+    };
+
+    if size == 0 {
+        return Err(Error::ExtractIssuerFailed);
+    }
+
+    if size < 0 {
+        // Our buffer wasn't big enough. Make one that is just the right size and try again.
+        let negated_size = usize::try_from(-size).map_err(|_e| Error::ExtractIssuerFailed)?;
+        retval = vec![0; negated_size];
+
+        // Safety: extractIssuerFromCertificate reads at most cert_buf.len() bytes from cert_buf
+        // and writes at most retval.len() bytes to retval.
+        size = unsafe {
+            extractIssuerFromCertificate(
+                cert_buf.as_ptr(),
+                cert_buf.len(),
+                retval.as_mut_ptr(),
+                retval.len(),
+            )
+        };
+
+        if size <= 0 {
+            return Err(Error::ExtractIssuerFailed);
+        }
+    }
+
+    // Reduce buffer size to the amount written.
+    let safe_size = usize::try_from(size).map_err(|_e| Error::ExtractIssuerFailed)?;
+    retval.truncate(safe_size);
+
+    Ok(retval)
+}
+
+/// Extracts patchlevels from Android attestation extension in a DER-encoded certificate.
+///
+/// Returns `(os_patchlevel, vendor_patchlevel, boot_patchlevel)`, where each field is `Some(i32)`
+/// if found, or `None` otherwise.
+pub fn extract_attestation_patchlevels(
+    cert_buf: &[u8],
+) -> (Option<i32>, Option<i32>, Option<i32>) {
+    let mut os_patchlevel = 0i32;
+    let mut vendor_patchlevel = 0i32;
+    let mut boot_patchlevel = 0i32;
+    // Safety: extractAttestationPatchLevels only reads cert_buf and conditionally writes outputs.
+    let mask = unsafe {
+        extractAttestationPatchLevels(
+            cert_buf.as_ptr(),
+            cert_buf.len(),
+            &mut os_patchlevel,
+            &mut vendor_patchlevel,
+            &mut boot_patchlevel,
+        )
+    } as u32;
+
+    let os = if (mask & 0x1) != 0 { Some(os_patchlevel) } else { None };
+    let vendor = if (mask & 0x2) != 0 { Some(vendor_patchlevel) } else { None };
+    let boot = if (mask & 0x4) != 0 { Some(boot_patchlevel) } else { None };
+    (os, vendor, boot)
+}
+
+
+/// Verifies that `child_cert_buf` is signed by `parent_cert_buf`.
+pub fn verify_certificate_signed_by(child_cert_buf: &[u8], parent_cert_buf: &[u8]) -> bool {
+    // Safety: verifyCertificateSignedBy only reads the provided buffers.
+    unsafe {
+        verifyCertificateSignedBy(
+            child_cert_buf.as_ptr(),
+            child_cert_buf.len(),
+            parent_cert_buf.as_ptr(),
+            parent_cert_buf.len(),
+        )
+    }
+}
+
+/// Returns certificate signature key family:
+/// - `Some("rsa")` when certificate signature is RSA-based
+/// - `Some("ec")` when certificate signature is EC/ECDSA-based
+/// - `None` for unknown/unsupported signature family
+pub fn certificate_signature_key_family(cert_buf: &[u8]) -> Option<&'static str> {
+    // Safety: getCertificateSignatureKeyFamily only reads the provided buffer.
+    match unsafe { getCertificateSignatureKeyFamily(cert_buf.as_ptr(), cert_buf.len()) } {
+        1 => Some("rsa"),
+        2 => Some("ec"),
+        _ => None,
+    }
+}
+
+/// Returns certificate subject public key family:
+/// - `Some("rsa")` when SPKI key is RSA
+/// - `Some("ec")` when SPKI key is EC
+/// - `None` for unknown/unsupported key family
+pub fn certificate_public_key_family(cert_buf: &[u8]) -> Option<&'static str> {
+    // Safety: getCertificatePublicKeyFamily only reads the provided buffer.
+    match unsafe { getCertificatePublicKeyFamily(cert_buf.as_ptr(), cert_buf.len()) } {
+        1 => Some("rsa"),
+        2 => Some("ec"),
+        _ => None,
+    }
+}
+
+/// Returns TBSCertificate.signature key family:
+/// - `Some("rsa")` when TBS signature algorithm is RSA-based
+/// - `Some("ec")` when TBS signature algorithm is EC/ECDSA-based
+/// - `None` for unknown/unsupported algorithm family
+pub fn certificate_tbs_signature_key_family(cert_buf: &[u8]) -> Option<&'static str> {
+    // Safety: getCertificateTbsSignatureKeyFamily only reads the provided buffer.
+    match unsafe { getCertificateTbsSignatureKeyFamily(cert_buf.as_ptr(), cert_buf.len()) } {
+        1 => Some("rsa"),
+        2 => Some("ec"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

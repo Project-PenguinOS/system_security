@@ -95,6 +95,18 @@ pub enum Error {
     #[error("Failed to extract certificate subject.")]
     ExtractSubjectFailed,
 
+    /// This is returned if the C implementation of extractIssuerFromCertificate failed.
+    #[error("Failed to extract certificate issuer.")]
+    ExtractIssuerFailed,
+
+    /// This is returned if the C implementation of resignLeafCertificate failed.
+    #[error("Failed to re-sign certificate.")]
+    ResignCertificateFailed,
+
+    /// This is returned if the C implementation of generateSoftwareAttestedKey failed.
+    #[error("Failed to generate software attested key.")]
+    GenerateKeyFailed,
+
     /// This is returned if the C implementation of hmacSha256 failed.
     #[error("Failed to calculate HMAC-SHA256.")]
     HmacSha256Failed,

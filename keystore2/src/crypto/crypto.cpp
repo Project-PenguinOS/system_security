@@ -18,19 +18,33 @@
 
 #include "crypto.hpp"
 
+#include "certificate_utils.h"
+
+#include <android-base/properties.h>
 #include <assert.h>
 #include <log/log.h>
 #include <openssl/aes.h>
 #include <openssl/ec.h>
 #include <openssl/ec_key.h>
 #include <openssl/ecdh.h>
+#include <openssl/base64.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
+#include <openssl/obj.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs8.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
 #include <openssl/x509.h>
 
+#include <memory>
+#include <string_view>
 #include <vector>
+#include <fstream>
+#include <sstream>
+#include <sys/stat.h>
 
 // Copied from system/security/keystore/blob.h.
 
@@ -319,3 +333,377 @@ int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len, uint
     uint8_t* tmp = subject_buf;
     return i2d_X509_NAME(subject, &tmp);
 }
+
+int extractIssuerFromCertificate(const uint8_t* cert_buf, size_t cert_len, uint8_t* issuer_buf,
+                                 size_t issuer_buf_len) {
+    if (!cert_buf || !issuer_buf) {
+        ALOGE("extractIssuerFromCertificate: received null pointer");
+        return 0;
+    }
+
+    const uint8_t* p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr /* Allocate X509 struct */, &p, cert_len));
+    if (!cert) {
+        ALOGE("extractIssuerFromCertificate: failed to parse certificate");
+        return 0;
+    }
+
+    X509_NAME* issuer = X509_get_issuer_name(cert.get());
+    if (!issuer) {
+        ALOGE("extractIssuerFromCertificate: failed to retrieve issuer name");
+        return 0;
+    }
+
+    int issuer_len = i2d_X509_NAME(issuer, nullptr /* Don't copy the data */);
+    if (issuer_len < 0) {
+        ALOGE("extractIssuerFromCertificate: error obtaining encoded issuer name length");
+        return 0;
+    }
+
+    if (issuer_len > issuer_buf_len) {
+        ALOGI("extractIssuerFromCertificate: needed %d bytes for issuer, caller provided %zu",
+              issuer_len, issuer_buf_len);
+        return -issuer_len;
+    }
+
+    uint8_t* tmp = issuer_buf;
+    return i2d_X509_NAME(issuer, &tmp);
+}
+
+static void appendDerLength(std::vector<uint8_t>* out, size_t len) {
+    if (len < 0x80) {
+        out->push_back(static_cast<uint8_t>(len));
+        return;
+    }
+    uint8_t tmp[8];
+    size_t n = 0;
+    size_t v = len;
+    while (v > 0) {
+        tmp[n++] = static_cast<uint8_t>(v & 0xff);
+        v >>= 8;
+    }
+    out->push_back(static_cast<uint8_t>(0x80 | n));
+    while (n > 0) {
+        out->push_back(tmp[--n]);
+    }
+}
+
+static std::vector<uint8_t> makeDerTlv(uint8_t tag, const std::vector<uint8_t>& value) {
+    std::vector<uint8_t> out;
+    out.reserve(1 + 5 + value.size());
+    out.push_back(tag);
+    appendDerLength(&out, value.size());
+    out.insert(out.end(), value.begin(), value.end());
+    return out;
+}
+
+static bool parseOneDerElement(const uint8_t* buf, size_t len, size_t* total_len, size_t* hdr_len,
+                               uint32_t* tag_number, bool* tag_ctx_specific) {
+    if (!buf || len < 2 || !total_len || !hdr_len || !tag_number || !tag_ctx_specific) return false;
+
+    size_t pos = 0;
+    const uint8_t first = buf[pos++];
+    *tag_ctx_specific = (first & 0xC0) == 0x80;
+    uint32_t tag = first & 0x1F;
+    if (tag == 0x1F) {
+        tag = 0;
+        bool saw_last = false;
+        while (pos < len) {
+            const uint8_t b = buf[pos++];
+            tag = (tag << 7) | (b & 0x7F);
+            if ((b & 0x80) == 0) {
+                saw_last = true;
+                break;
+            }
+        }
+        if (!saw_last) return false;
+    }
+    *tag_number = tag;
+
+    if (pos >= len) return false;
+    uint8_t l = buf[pos++];
+    size_t value_len = 0;
+    if ((l & 0x80) == 0) {
+        value_len = l;
+    } else {
+        size_t n = l & 0x7F;
+        if (n == 0 || n > sizeof(size_t) || pos + n > len) return false;
+        for (size_t i = 0; i < n; ++i) {
+            value_len = (value_len << 8) | buf[pos++];
+        }
+    }
+    if (pos + value_len > len) return false;
+    *hdr_len = pos;
+    *total_len = pos + value_len;
+    return true;
+}
+
+static bool parseDerIntegerToInt32(const uint8_t* der, size_t der_len, int32_t* out) {
+    if (!der || der_len < 3 || !out) return false;
+    if (der[0] != 0x02) return false;  // INTEGER
+
+    size_t total_len = 0, hdr_len = 0;
+    uint32_t tag = 0;
+    bool is_ctx = false;
+    if (!parseOneDerElement(der, der_len, &total_len, &hdr_len, &tag, &is_ctx)) return false;
+    if (total_len != der_len || is_ctx || tag != 0x02) return false;
+
+    const uint8_t* value = der + hdr_len;
+    const size_t value_len = der_len - hdr_len;
+    if (value_len == 0 || value_len > 5) return false;
+
+    int64_t acc = 0;
+    for (size_t i = 0; i < value_len; ++i) {
+        acc = (acc << 8) | value[i];
+    }
+
+    if ((value[0] & 0x80) != 0) {
+        // Two's complement sign extension for negative values.
+        const int shift = static_cast<int>((8 - value_len) * 8);
+        acc = (acc << shift) >> shift;
+    }
+
+    if (acc < INT32_MIN || acc > INT32_MAX) return false;
+    *out = static_cast<int32_t>(acc);
+    return true;
+}
+
+static uint32_t extractPatchLevelsFromAuthorizationListDer(const std::vector<uint8_t>& auth_list_der,
+                                                           int32_t* out_os_patchlevel,
+                                                           int32_t* out_vendor_patchlevel,
+                                                           int32_t* out_boot_patchlevel) {
+    if (auth_list_der.empty() || auth_list_der[0] != 0x30) {
+        return 0;
+    }
+
+    size_t seq_total = 0, seq_hdr = 0;
+    uint32_t seq_tag = 0;
+    bool seq_ctx = false;
+    if (!parseOneDerElement(auth_list_der.data(), auth_list_der.size(), &seq_total, &seq_hdr, &seq_tag,
+                            &seq_ctx)) {
+        return 0;
+    }
+    if (seq_total != auth_list_der.size() || seq_ctx || seq_tag != 0x10) {
+        return 0;
+    }
+
+    uint32_t mask = 0;
+    const uint8_t* items = auth_list_der.data() + seq_hdr;
+    const size_t items_len = auth_list_der.size() - seq_hdr;
+    size_t pos = 0;
+    while (pos < items_len) {
+        size_t el_total = 0, el_hdr = 0;
+        uint32_t tag_no = 0;
+        bool is_ctx = false;
+        if (!parseOneDerElement(items + pos, items_len - pos, &el_total, &el_hdr, &tag_no, &is_ctx)) {
+            return mask;
+        }
+        if (is_ctx && (tag_no == 706 || tag_no == 718 || tag_no == 719)) {
+            const uint8_t* inner = items + pos + el_hdr;
+            const size_t inner_len = el_total - el_hdr;
+            int32_t value = 0;
+            if (parseDerIntegerToInt32(inner, inner_len, &value)) {
+                if (tag_no == 706) {
+                    if (out_os_patchlevel) *out_os_patchlevel = value;
+                    mask |= 0x1;
+                } else if (tag_no == 718) {
+                    if (out_vendor_patchlevel) *out_vendor_patchlevel = value;
+                    mask |= 0x2;
+                } else if (tag_no == 719) {
+                    if (out_boot_patchlevel) *out_boot_patchlevel = value;
+                    mask |= 0x4;
+                }
+            }
+        }
+        pos += el_total;
+    }
+    return mask;
+}
+
+bool verifyCertificateSignedBy(const uint8_t* child_cert_buf, size_t child_cert_len,
+                               const uint8_t* parent_cert_buf, size_t parent_cert_len) {
+    if (!child_cert_buf || !parent_cert_buf) {
+        ALOGE("verifyCertificateSignedBy: null pointer input");
+        return false;
+    }
+
+    const uint8_t* child_p = child_cert_buf;
+    bssl::UniquePtr<X509> child(d2i_X509(nullptr, &child_p, static_cast<long>(child_cert_len)));
+    if (!child) {
+        ALOGE("verifyCertificateSignedBy: failed to parse child cert");
+        return false;
+    }
+
+    const uint8_t* parent_p = parent_cert_buf;
+    bssl::UniquePtr<X509> parent(d2i_X509(nullptr, &parent_p, static_cast<long>(parent_cert_len)));
+    if (!parent) {
+        ALOGE("verifyCertificateSignedBy: failed to parse parent cert");
+        return false;
+    }
+
+    bssl::UniquePtr<EVP_PKEY> parent_pubkey(X509_get_pubkey(parent.get()));
+    if (!parent_pubkey) {
+        ALOGE("verifyCertificateSignedBy: failed to get parent pubkey");
+        return false;
+    }
+
+    if (X509_verify(child.get(), parent_pubkey.get()) != 1) {
+        ALOGE("verifyCertificateSignedBy: certificate signature verification failed");
+        return false;
+    }
+
+    return true;
+}
+
+int extractAttestationPatchLevels(const uint8_t* cert_buf, size_t cert_len, int32_t* out_os_patchlevel,
+                                  int32_t* out_vendor_patchlevel, int32_t* out_boot_patchlevel) {
+    if (!cert_buf || cert_len == 0) {
+        ALOGE("extractAttestationPatchLevels: invalid cert input");
+        return 0;
+    }
+
+    const uint8_t* p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, static_cast<long>(cert_len)));
+    if (!cert) {
+        ALOGE("extractAttestationPatchLevels: failed to parse cert");
+        return 0;
+    }
+
+    ASN1_OBJECT* att_oid_obj = OBJ_txt2obj("1.3.6.1.4.1.11129.2.1.17", 1);
+    if (!att_oid_obj) return 0;
+    int ext_idx = X509_get_ext_by_OBJ(cert.get(), att_oid_obj, -1);
+    ASN1_OBJECT_free(att_oid_obj);
+    if (ext_idx < 0) return 0;
+
+    X509_EXTENSION* ext = X509_get_ext(cert.get(), ext_idx);
+    if (!ext) return 0;
+    ASN1_OCTET_STRING* ext_data = X509_EXTENSION_get_data(ext);
+    if (!ext_data || !ext_data->data || ext_data->length <= 0) return 0;
+
+    const uint8_t* ext_ptr = ext_data->data;
+    STACK_OF(ASN1_TYPE)* key_desc = d2i_ASN1_SEQUENCE_ANY(nullptr, &ext_ptr, ext_data->length);
+    if (!key_desc) return 0;
+
+    uint32_t mask = 0;
+    for (int i = 0; i < sk_ASN1_TYPE_num(key_desc); ++i) {
+        if (i != 6 && i != 7) continue;  // softwareEnforced and teeEnforced
+        ASN1_TYPE* item = sk_ASN1_TYPE_value(key_desc, i);
+        if (!item) continue;
+        const int n = i2d_ASN1_TYPE(item, nullptr);
+        if (n <= 0) continue;
+        std::vector<uint8_t> buf(static_cast<size_t>(n));
+        uint8_t* ptr = buf.data();
+        if (i2d_ASN1_TYPE(item, &ptr) <= 0) continue;
+        mask |= extractPatchLevelsFromAuthorizationListDer(buf, out_os_patchlevel, out_vendor_patchlevel,
+                                                           out_boot_patchlevel);
+    }
+
+    sk_ASN1_TYPE_pop_free(key_desc, ASN1_TYPE_free);
+    return static_cast<int>(mask);
+}
+
+int getCertificateSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len) {
+    if (!cert_buf) {
+        ALOGE("getCertificateSignatureKeyFamily: null pointer input");
+        return 0;
+    }
+
+    const uint8_t* p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, static_cast<long>(cert_len)));
+    if (!cert) {
+        ALOGE("getCertificateSignatureKeyFamily: failed to parse cert");
+        return 0;
+    }
+
+    int sig_nid = X509_get_signature_nid(cert.get());
+    if (sig_nid == NID_undef) {
+        ALOGE("getCertificateSignatureKeyFamily: certificate signature nid undefined");
+        return 0;
+    }
+
+    int pkey_nid = NID_undef;
+    if (OBJ_find_sigid_algs(sig_nid, nullptr, &pkey_nid) != 1) {
+        ALOGE("getCertificateSignatureKeyFamily: failed to derive signature key algorithm");
+        return 0;
+    }
+
+    switch (EVP_PKEY_type(pkey_nid)) {
+    case EVP_PKEY_RSA:
+        return 1;
+    case EVP_PKEY_EC:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+int getCertificatePublicKeyFamily(const uint8_t* cert_buf, size_t cert_len) {
+    if (!cert_buf) {
+        ALOGE("getCertificatePublicKeyFamily: null pointer input");
+        return 0;
+    }
+
+    const uint8_t* p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, static_cast<long>(cert_len)));
+    if (!cert) {
+        ALOGE("getCertificatePublicKeyFamily: failed to parse cert");
+        return 0;
+    }
+
+    bssl::UniquePtr<EVP_PKEY> pubkey(X509_get_pubkey(cert.get()));
+    if (!pubkey) {
+        ALOGE("getCertificatePublicKeyFamily: failed to extract public key");
+        return 0;
+    }
+
+    switch (EVP_PKEY_base_id(pubkey.get())) {
+    case EVP_PKEY_RSA:
+        return 1;
+    case EVP_PKEY_EC:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+int getCertificateTbsSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len) {
+    if (!cert_buf) {
+        ALOGE("getCertificateTbsSignatureKeyFamily: null pointer input");
+        return 0;
+    }
+
+    const uint8_t* p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, static_cast<long>(cert_len)));
+    if (!cert) {
+        ALOGE("getCertificateTbsSignatureKeyFamily: failed to parse cert");
+        return 0;
+    }
+
+    const X509_ALGOR* tbs_sig_alg = X509_get0_tbs_sigalg(cert.get());
+    if (!tbs_sig_alg || !tbs_sig_alg->algorithm) {
+        ALOGE("getCertificateTbsSignatureKeyFamily: missing tbs signature algorithm");
+        return 0;
+    }
+
+    int sig_nid = OBJ_obj2nid(tbs_sig_alg->algorithm);
+    if (sig_nid == NID_undef) {
+        ALOGE("getCertificateTbsSignatureKeyFamily: tbs signature nid undefined");
+        return 0;
+    }
+
+    int pkey_nid = NID_undef;
+    if (OBJ_find_sigid_algs(sig_nid, nullptr, &pkey_nid) != 1) {
+        ALOGE("getCertificateTbsSignatureKeyFamily: failed to derive tbs signature key algorithm");
+        return 0;
+    }
+
+    switch (EVP_PKEY_type(pkey_nid)) {
+    case EVP_PKEY_RSA:
+        return 1;
+    case EVP_PKEY_EC:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
