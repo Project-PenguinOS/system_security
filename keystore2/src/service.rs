@@ -51,8 +51,12 @@ use android_system_keystore2::aidl::android::system::keystore2::{
 };
 use anyhow::{Context, Result};
 use error::Error;
+use keystore2_crypto::{
+    certificate_public_key_family, certificate_signature_key_family,
+    certificate_tbs_signature_key_family,
+};
 use keystore2_selinux as selinux;
-use log::error;
+use log::{error, info};
 
 /// Implementation of the IKeystoreService.
 #[derive(Default)]
@@ -135,6 +139,70 @@ impl KeystoreService {
         }
     }
 
+    fn der_cert_total_len(buf: &[u8], offset: usize) -> Option<usize> {
+        let first = *buf.get(offset)?;
+        if first != 0x30 {
+            return None;
+        }
+        let len_byte = *buf.get(offset + 1)?;
+        if len_byte & 0x80 == 0 {
+            let content_len = usize::from(len_byte);
+            return Some(2 + content_len);
+        }
+        let len_len = usize::from(len_byte & 0x7f);
+        if len_len == 0 || len_len > 8 {
+            return None;
+        }
+        let mut content_len = 0usize;
+        for i in 0..len_len {
+            content_len = (content_len << 8) | usize::from(*buf.get(offset + 2 + i)?);
+        }
+        Some(2 + len_len + content_len)
+    }
+
+    fn split_concatenated_der_certs(buf: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let Some(total_len) = Self::der_cert_total_len(buf, offset) else {
+                break;
+            };
+            let end = offset.saturating_add(total_len);
+            if end > buf.len() {
+                break;
+            }
+            out.push(&buf[offset..end]);
+            offset = end;
+        }
+        out
+    }
+
+    fn summarize_exported_chain(
+        cert: Option<&[u8]>,
+        cert_chain_concat: Option<&[u8]>,
+    ) -> Vec<String> {
+        let mut certs: Vec<&[u8]> = Vec::new();
+        if let Some(leaf) = cert {
+            certs.push(leaf);
+        }
+        if let Some(chain_concat) = cert_chain_concat {
+            certs.extend(Self::split_concatenated_der_certs(chain_concat));
+        }
+        certs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "#{i}:sig={:?},tbs_sig={:?},pub={:?},len={}",
+                    certificate_signature_key_family(c),
+                    certificate_tbs_signature_key_family(c),
+                    certificate_public_key_family(c),
+                    c.len()
+                )
+            })
+            .collect()
+    }
+
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
         let caller_uid = AppUid::calling();
 
@@ -166,6 +234,17 @@ impl KeystoreService {
             None
         };
 
+        let certificate = key_entry.take_cert();
+        let certificate_chain = key_entry.take_cert_chain();
+        let exported_summary =
+            Self::summarize_exported_chain(certificate.as_deref(), certificate_chain.as_deref());
+        info!(
+            "keystore2 export: key={:?}, caller_uid={:?}, exported_chain_summary={:?}",
+            key,
+            caller_uid,
+            exported_summary
+        );
+
         Ok(KeyEntryResponse {
             iSecurityLevel: i_sec_level,
             metadata: KeyMetadata {
@@ -175,8 +254,8 @@ impl KeystoreService {
                     ..Default::default()
                 },
                 keySecurityLevel: self.uuid_to_sec_level(key_entry.km_uuid()),
-                certificate: key_entry.take_cert(),
-                certificateChain: key_entry.take_cert_chain(),
+                certificate,
+                certificateChain: certificate_chain,
                 modificationTimeMs: key_entry
                     .metadata()
                     .creation_date()
