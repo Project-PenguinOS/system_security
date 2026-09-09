@@ -20,13 +20,14 @@ pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
     extractAttestationPatchLevels, extractIssuerFromCertificate, extractSubjectFromCertificate,
+    generateSoftwareAttestedKey,
     hmacSha256, randomBytes,
     AES_gcm_decrypt, AES_gcm_encrypt,
     getCertificatePublicKeyFamily, getCertificateSignatureKeyFamily,
     getCertificateTbsSignatureKeyFamily,
     ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey, ECKEYParsePrivateKey,
     ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free,
-    HKDFExpand, HKDFExtract, PBKDF2, verifyCertificateSignedBy, EC_KEY,
+    HKDFExpand, HKDFExtract, PBKDF2, resignLeafCertificate, verifyCertificateSignedBy, EC_KEY,
     EC_POINT, EVP_MAX_MD_SIZE,
 };
 use std::convert::TryFrom;
@@ -583,6 +584,132 @@ pub fn extract_attestation_patchlevels(
     (os, vendor, boot)
 }
 
+/// Re-signs a DER-encoded leaf certificate using the provided signing key and issuer certificate.
+///
+/// `signing_key_buf` supports either PEM bytes (with BEGIN/END markers) or DER key bytes.
+pub fn resign_leaf_certificate(
+    leaf_cert_buf: &[u8],
+    signing_cert_buf: &[u8],
+    signing_key_buf: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut retval = vec![0; 4096];
+
+    // Safety: resignLeafCertificate reads at most input lengths from inputs and writes at most
+    // retval.len() bytes to retval.
+    let mut size = unsafe {
+        resignLeafCertificate(
+            leaf_cert_buf.as_ptr(),
+            leaf_cert_buf.len(),
+            signing_cert_buf.as_ptr(),
+            signing_cert_buf.len(),
+            signing_key_buf.as_ptr(),
+            signing_key_buf.len(),
+            retval.as_mut_ptr(),
+            retval.len(),
+        )
+    };
+
+    if size == 0 {
+        return Err(Error::ResignCertificateFailed);
+    }
+
+    if size < 0 {
+        let needed_size = usize::try_from(-size).map_err(|_e| Error::ResignCertificateFailed)?;
+        retval = vec![0; needed_size];
+        // Safety: Same as above with resized output buffer.
+        size = unsafe {
+            resignLeafCertificate(
+                leaf_cert_buf.as_ptr(),
+                leaf_cert_buf.len(),
+                signing_cert_buf.as_ptr(),
+                signing_cert_buf.len(),
+                signing_key_buf.as_ptr(),
+                signing_key_buf.len(),
+                retval.as_mut_ptr(),
+                retval.len(),
+            )
+        };
+        if size <= 0 {
+            return Err(Error::ResignCertificateFailed);
+        }
+    }
+
+    let safe_size = usize::try_from(size).map_err(|_e| Error::ResignCertificateFailed)?;
+    retval.truncate(safe_size);
+    Ok(retval)
+}
+
+/// Generates a software-backed key and attestation certificate signed by the provided issuer.
+///
+/// Returns `(pkcs8_private_key, der_certificate)`.
+pub fn generate_software_attested_key(
+    key_type: i32,
+    rsa_key_size: i32,
+    challenge: &[u8],
+    signing_cert_buf: &[u8],
+    signing_key_buf: &[u8],
+    is_attest_key: bool,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let mut privkey_buf = vec![0u8; 4096];
+    let mut privkey_len: usize = 0;
+    let mut cert_buf = vec![0u8; 4096];
+
+    // Safety: generateSoftwareAttestedKey reads at most input lengths from inputs and writes at most
+    // buffer capacities to privkey_buf and cert_buf.
+    let mut size = unsafe {
+        generateSoftwareAttestedKey(
+            key_type,
+            rsa_key_size,
+            challenge.as_ptr(),
+            challenge.len(),
+            signing_cert_buf.as_ptr(),
+            signing_cert_buf.len(),
+            signing_key_buf.as_ptr(),
+            signing_key_buf.len(),
+            if is_attest_key { 1 } else { 0 },
+            privkey_buf.as_mut_ptr(),
+            privkey_buf.len(),
+            &mut privkey_len,
+            cert_buf.as_mut_ptr(),
+            cert_buf.len(),
+        )
+    };
+
+    if size == 0 {
+        return Err(Error::GenerateKeyFailed);
+    }
+
+    if size < 0 {
+        let needed = usize::try_from(-size).map_err(|_| Error::GenerateKeyFailed)?;
+        cert_buf = vec![0u8; needed];
+        // Safety: Same as above with resized output buffer.
+        size = unsafe {
+            generateSoftwareAttestedKey(
+                key_type,
+                rsa_key_size,
+                challenge.as_ptr(),
+                challenge.len(),
+                signing_cert_buf.as_ptr(),
+                signing_cert_buf.len(),
+                signing_key_buf.as_ptr(),
+                signing_key_buf.len(),
+                if is_attest_key { 1 } else { 0 },
+                privkey_buf.as_mut_ptr(),
+                privkey_buf.len(),
+                &mut privkey_len,
+                cert_buf.as_mut_ptr(),
+                cert_buf.len(),
+            )
+        };
+        if size <= 0 {
+            return Err(Error::GenerateKeyFailed);
+        }
+    }
+
+    privkey_buf.truncate(privkey_len);
+    cert_buf.truncate(size as usize);
+    Ok((privkey_buf, cert_buf))
+}
 
 /// Verifies that `child_cert_buf` is signed by `parent_cert_buf`.
 pub fn verify_certificate_signed_by(child_cert_buf: &[u8], parent_cert_buf: &[u8]) -> bool {

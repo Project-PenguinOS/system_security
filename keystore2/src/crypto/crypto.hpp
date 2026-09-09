@@ -67,16 +67,52 @@ extern "C" {
 // Parse a DER-encoded X.509 certificate contained in cert_buf, with length
 // cert_len, extract the subject, DER-encode it and write the result to
 // subject_buf, which has subject_buf_len capacity.
+//
+// Because the length of the subject is unknown, and because we'd like to (a) be
+// able to handle subjects of any size and (b) avoid parsing the certificate
+// twice most of the time, once to discover the length and once to parse it, the
+// return value is overloaded.
+//
+// If the return value > 0 it specifies the number of bytes written into
+// subject_buf; the operation was successful.
+//
+// If the return value == 0, certificate parsing failed unrecoverably.  The
+// reason will be logged.
+//
+// If the return value < 0, the operation failed because the subject size >
+// subject_buf_len.  The return value is -(subject_size), where subject_size is
+// the size of the extracted DER-encoded subject field.  Call
+// extractSubjectFromCertificate again with a sufficiently-large buffer.
 int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len,
                                   uint8_t* subject_buf, size_t subject_buf_len);
 
 // Parse a DER-encoded X.509 certificate contained in cert_buf, with length
 // cert_len, extract the issuer, DER-encode it and write the result to
 // issuer_buf, which has issuer_buf_len capacity.
+//
+// Return value semantics are identical to extractSubjectFromCertificate:
+// - > 0: success, number of bytes written
+// - = 0: unrecoverable failure
+// - < 0: output buffer too small, required size is -ret
 int extractIssuerFromCertificate(const uint8_t* cert_buf, size_t cert_len,
                                  uint8_t* issuer_buf, size_t issuer_buf_len);
 
+// Re-sign a DER-encoded leaf certificate with a private key and issuer certificate.
+//
+// `signing_key_buf` supports either PEM text ("BEGIN PRIVATE KEY") or DER key bytes.
+//
+// Return value semantics:
+// - > 0: success, number of bytes written to out_cert_buf.
+// - = 0: failure.
+// - < 0: output buffer too small; required size is `-ret`.
+int resignLeafCertificate(const uint8_t* leaf_cert_buf, size_t leaf_cert_len,
+                          const uint8_t* signing_cert_buf, size_t signing_cert_len,
+                          const uint8_t* signing_key_buf, size_t signing_key_len,
+                          uint8_t* out_cert_buf, size_t out_cert_buf_len);
+
 // Verify that `child_cert_buf` is signed by `parent_cert_buf` public key.
+//
+// Return true on successful verification, false otherwise.
 bool verifyCertificateSignedBy(const uint8_t* child_cert_buf, size_t child_cert_len,
                                const uint8_t* parent_cert_buf, size_t parent_cert_len);
 
@@ -99,7 +135,37 @@ int getCertificatePublicKeyFamily(const uint8_t* cert_buf, size_t cert_len);
 int getCertificateTbsSignatureKeyFamily(const uint8_t* cert_buf, size_t cert_len);
 
 // Extract patch levels from Android attestation extension (OID 1.3.6.1.4.1.11129.2.1.17).
+//
+// Output pointers may be null. If non-null and the corresponding field is found, it is written.
+//
+// Return value is a bitmask:
+// - bit 0 (0x1): OS_PATCHLEVEL found
+// - bit 1 (0x2): VENDOR_PATCHLEVEL found
+// - bit 2 (0x4): BOOT_PATCHLEVEL found
+//
+// Returns 0 if parsing fails or none of the fields are found.
 int extractAttestationPatchLevels(const uint8_t* cert_buf, size_t cert_len, int32_t* out_os_patchlevel,
                                   int32_t* out_vendor_patchlevel, int32_t* out_boot_patchlevel);
+
+// Generate a software-backed key and signed attestation certificate.
+// key_type: 1 = RSA, 2 = EC (NIST P-256)
+// rsa_key_size: e.g. 2048
+// challenge: attestation challenge bytes
+// signing_cert_buf, signing_cert_len: signer certificate (DER)
+// signing_key_buf, signing_key_len: signer private key (DER or PEM)
+// is_attest_key: whether KeyPurpose::ATTEST_KEY is requested
+// out_privkey_buf, out_privkey_buf_len: buffer to receive PKCS#8 private key
+// out_privkey_len: written length of PKCS#8 private key
+// out_cert_buf, out_cert_buf_len: buffer to receive DER X.509 certificate
+// Return value: > 0 (cert length on success), 0 on failure, < 0 if cert buffer too small (-needed)
+int generateSoftwareAttestedKey(
+        int key_type, int rsa_key_size,
+        const uint8_t* challenge, size_t challenge_len,
+        const uint8_t* signing_cert_buf, size_t signing_cert_len,
+        const uint8_t* signing_key_buf, size_t signing_key_len,
+        int is_attest_key,
+        uint8_t* out_privkey_buf, size_t out_privkey_buf_len,
+        size_t* out_privkey_len,
+        uint8_t* out_cert_buf, size_t out_cert_buf_len);
 
 #endif  //  __CRYPTO_H__
