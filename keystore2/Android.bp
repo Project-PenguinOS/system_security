@@ -46,6 +46,7 @@ rust_defaults {
         "libaconfig_android_hardware_biometrics_rust",
         "libandroid_security_flags_rust",
         "libanyhow",
+        "libbase64_rust",
         "libbinder_rs",
         "libbssl_crypto",
         "libder",

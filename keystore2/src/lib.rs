@@ -41,6 +41,7 @@ pub mod security_level;
 pub mod security_level_manager;
 pub mod service;
 pub mod shared_secret_negotiation;
+mod attestation_compat;
 pub mod utils;
 
 mod attestation_key_utils;
