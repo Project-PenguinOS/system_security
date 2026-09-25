@@ -675,6 +675,41 @@ static uint32_t extractPatchLevelsFromAuthorizationListDer(const std::vector<uin
     return mask;
 }
 
+static std::vector<uint8_t> makeExplicitContextTlv(uint32_t tag_no, const std::vector<uint8_t>& val) {
+    std::vector<uint8_t> out;
+    if (tag_no < 31) {
+        out.push_back(static_cast<uint8_t>(0xA0 | tag_no));
+    } else {
+        out.push_back(0xBF);
+        if (tag_no < 128) {
+            out.push_back(static_cast<uint8_t>(tag_no));
+        } else {
+            out.push_back(static_cast<uint8_t>((tag_no >> 7) | 0x80));
+            out.push_back(static_cast<uint8_t>(tag_no & 0x7F));
+        }
+    }
+    appendDerLength(&out, val.size());
+    out.insert(out.end(), val.begin(), val.end());
+    return out;
+}
+
+static std::string getAttestationIdOverride(uint32_t tag_no) {
+    switch (tag_no) {
+        case 710: // ATTESTATION_ID_BRAND
+            return android::base::GetProperty("ro.product.brand", "");
+        case 711: // ATTESTATION_ID_DEVICE
+            return android::base::GetProperty("ro.product.device", "");
+        case 712: // ATTESTATION_ID_PRODUCT
+            return android::base::GetProperty("ro.product.name", "");
+        case 716: // ATTESTATION_ID_MANUFACTURER
+            return android::base::GetProperty("ro.product.manufacturer", "");
+        case 717: // ATTESTATION_ID_MODEL
+            return android::base::GetProperty("ro.product.model", "");
+        default:
+            return "";
+    }
+}
+
 static bool replaceRootOfTrustInTeeEnforced(const std::vector<uint8_t>& tee_enforced_der,
                                             const std::vector<uint8_t>& boot_key,
                                             const std::vector<uint8_t>& boot_hash,
@@ -708,7 +743,18 @@ static bool replaceRootOfTrustInTeeEnforced(const std::vector<uint8_t>& tee_enfo
         if (!parseOneDerElement(items + pos, items_len - pos, &el_total, &el_hdr, &tag_no, &is_ctx)) {
             return false;
         }
-        if (!(is_ctx && tag_no == 704)) {
+        if (is_ctx && tag_no == 704) {
+        } else if (is_ctx && (tag_no == 710 || tag_no == 711 || tag_no == 712 || tag_no == 716 || tag_no == 717)) {
+            std::string spoofed = getAttestationIdOverride(tag_no);
+            if (!spoofed.empty()) {
+                std::vector<uint8_t> str_bytes(spoofed.begin(), spoofed.end());
+                std::vector<uint8_t> octet = makeDerTlv(0x04, str_bytes);
+                std::vector<uint8_t> tagged = makeExplicitContextTlv(tag_no, octet);
+                rebuilt_items.insert(rebuilt_items.end(), tagged.begin(), tagged.end());
+            } else {
+                rebuilt_items.insert(rebuilt_items.end(), items + pos, items + pos + el_total);
+            }
+        } else {
             rebuilt_items.insert(rebuilt_items.end(), items + pos, items + pos + el_total);
         }
         pos += el_total;
@@ -739,24 +785,6 @@ static bool replaceRootOfTrustInTeeEnforced(const std::vector<uint8_t>& tee_enfo
 
     *out = makeDerTlv(0x30, rebuilt_items);
     return true;
-}
-
-static std::vector<uint8_t> makeExplicitContextTlv(uint32_t tag_no, const std::vector<uint8_t>& val) {
-    std::vector<uint8_t> out;
-    if (tag_no < 31) {
-        out.push_back(static_cast<uint8_t>(0xA0 | tag_no));
-    } else {
-        out.push_back(0xBF);
-        if (tag_no < 128) {
-            out.push_back(static_cast<uint8_t>(tag_no));
-        } else {
-            out.push_back(static_cast<uint8_t>((tag_no >> 7) | 0x80));
-            out.push_back(static_cast<uint8_t>(tag_no & 0x7F));
-        }
-    }
-    appendDerLength(&out, val.size());
-    out.insert(out.end(), val.begin(), val.end());
-    return out;
 }
 
 static constexpr const char* kHarvestFile = "/data/system/keystore_compat/harvested.json";
@@ -1497,6 +1525,13 @@ int generateSoftwareAttestedKey(
     auto tag5 = makeExplicitContextTlv(5, dig_set);
     tee_items.insert(tee_items.end(), tag5.begin(), tag5.end());
 
+    if (key_algorithm_val == 1) {
+        const std::vector<uint8_t> mgf_dig_set_val = {0x02, 0x01, 0x02, 0x02, 0x01, 0x04}; // SHA-1, SHA-256
+        std::vector<uint8_t> mgf_set = makeDerTlv(0x31, mgf_dig_set_val);
+        auto tag203 = makeExplicitContextTlv(203, mgf_set);
+        tee_items.insert(tee_items.end(), tag203.begin(), tag203.end());
+    }
+
     std::vector<uint8_t> null_val = {0x05, 0x00};
     auto tag503 = makeExplicitContextTlv(503, null_val);
     tee_items.insert(tee_items.end(), tag503.begin(), tag503.end());
@@ -1516,6 +1551,17 @@ int generateSoftwareAttestedKey(
     auto tag706 = makeExplicitContextTlv(706, os_patch_val);
     tee_items.insert(tee_items.end(), tag706.begin(), tag706.end());
 
+    const uint32_t id_tags[] = {710, 711, 712, 716, 717};
+    for (uint32_t id_tag : id_tags) {
+        std::string val = getAttestationIdOverride(id_tag);
+        if (!val.empty()) {
+            std::vector<uint8_t> str_bytes(val.begin(), val.end());
+            std::vector<uint8_t> octet = makeDerTlv(0x04, str_bytes);
+            auto tagged = makeExplicitContextTlv(id_tag, octet);
+            tee_items.insert(tee_items.end(), tagged.begin(), tagged.end());
+        }
+    }
+
     std::vector<uint8_t> tee_enforced_seq = makeDerTlv(0x30, tee_items);
 
     std::vector<uint8_t> kd_items;
@@ -1523,7 +1569,8 @@ int generateSoftwareAttestedKey(
     const std::vector<uint8_t> att_sec = {0x0A, 0x01, 0x01};
     const std::vector<uint8_t> km_ver = {0x02, 0x02, 0x01, 0x2C};
     const std::vector<uint8_t> km_sec = {0x0A, 0x01, 0x01};
-    std::vector<uint8_t> chal_oct = makeDerTlv(0x04, std::vector<uint8_t>(challenge, challenge + challenge_len));
+    size_t safe_challenge_len = std::min(challenge_len, static_cast<size_t>(128));
+    std::vector<uint8_t> chal_oct = makeDerTlv(0x04, std::vector<uint8_t>(challenge, challenge + safe_challenge_len));
     const std::vector<uint8_t> uniq_id = {0x04, 0x00};
     const std::vector<uint8_t> sw_enforced = {0x30, 0x00};
 

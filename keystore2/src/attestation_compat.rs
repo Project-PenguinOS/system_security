@@ -462,7 +462,14 @@ pub(crate) fn generate_software_key_for_uid(
         .iter()
         .find(|p| p.tag == Tag::ATTESTATION_CHALLENGE)
         .and_then(|p| match &p.value {
-            KeyParameterValue::Blob(b) => Some(b.as_slice()),
+            KeyParameterValue::Blob(b) => {
+                if b.len() > 128 {
+                    warn!("tee soft debug: oversized attestation challenge ({} bytes > 128), truncating to 128 bytes", b.len());
+                    Some(&b[..128])
+                } else {
+                    Some(b.as_slice())
+                }
+            }
             _ => None,
         })
         .unwrap_or(b"attest_challenge");
