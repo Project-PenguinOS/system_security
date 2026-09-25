@@ -35,7 +35,7 @@ use crate::remote_provisioning::RemProvState;
 use crate::security_level_manager;
 use crate::super_key::{KeyBlob, SuperKeyManager};
 use crate::attestation_compat::{
-    generate_software_key_for_uid,
+    generate_software_key_for_uid, is_simulated_blob, strip_simulated_blob,
     mark_generated_attest_key_for_uid, maybe_override_certificate_chain_for_uid,
     maybe_sync_patchlevel_authorizations_for_uid,
     should_treat_external_attest_key_as_compat_for_uid,
@@ -383,41 +383,62 @@ impl KeystoreSecurityLevel {
             .unwrap_key_if_required(&blob_metadata, km_blob)
             .context(ks_err!("Failed to handle super encryption."))?;
 
+        let is_simulated = is_simulated_blob(&km_blob);
+        let soft_keymint_device = if is_simulated {
+            match get_keymint_device(&SecurityLevel::SOFTWARE) {
+                Ok((dev, _, _)) => Some(dev),
+                Err(e) => {
+                    warn!("Failed to obtain software keymint device for simulated key operation: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let (begin_result, upgraded_blob) = self
             .upgrade_keyblob_if_required_with(
                 key_id_guard,
                 &km_blob,
                 blob_metadata.km_uuid().copied(),
                 operation_parameters,
-                |blob| loop {
-                    match map_km_error({
-                        let _wp = self.watch(
-                            "KeystoreSecurityLevel::create_operation: calling IKeyMintDevice::begin",
-                        );
-                        self.keymint.begin(
-                            purpose,
-                            blob,
-                            operation_parameters,
-                            immediate_hat.as_ref(),
-                        )
-                    }) {
-                        Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
-                            self.operation_db.prune(caller_uid, forced)?;
-                            continue;
-                        }
-                        v @ Err(Error::Km(ErrorCode::INVALID_KEY_BLOB)) => {
-                            if let Some((key_id, _)) = key_properties {
-                                if let Ok(Some(key)) =
-                                    DB.with(|db| db.borrow_mut().load_key_descriptor(key_id))
-                                {
-                                    log_key_integrity_violation(&key);
-                                } else {
-                                    error!("Failed to load key descriptor for audit log");
-                                }
+                |blob| {
+                    let actual_blob = if is_simulated {
+                        strip_simulated_blob(blob)
+                    } else {
+                        blob
+                    };
+                    let target_km = soft_keymint_device.as_ref().unwrap_or(&self.keymint);
+                    loop {
+                        match map_km_error({
+                            let _wp = self.watch(
+                                "KeystoreSecurityLevel::create_operation: calling IKeyMintDevice::begin",
+                            );
+                            target_km.begin(
+                                purpose,
+                                actual_blob,
+                                operation_parameters,
+                                immediate_hat.as_ref(),
+                            )
+                        }) {
+                            Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
+                                self.operation_db.prune(caller_uid, forced)?;
+                                continue;
                             }
-                            return v;
+                            v @ Err(Error::Km(ErrorCode::INVALID_KEY_BLOB)) => {
+                                if let Some((key_id, _)) = key_properties {
+                                    if let Ok(Some(key)) =
+                                        DB.with(|db| db.borrow_mut().load_key_descriptor(key_id))
+                                    {
+                                        log_key_integrity_violation(&key);
+                                    } else {
+                                        error!("Failed to load key descriptor for audit log");
+                                    }
+                                }
+                                return v;
+                            }
+                            v => return v,
                         }
-                        v => return v,
                     }
                 },
             )
