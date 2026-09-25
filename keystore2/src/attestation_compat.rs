@@ -823,12 +823,26 @@ fn extract_tag_values<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 
 fn pem_or_base64_to_der(raw: &str) -> Option<Vec<u8>> {
     let cleaned = strip_xml_comments(raw);
-    let mut payload = cleaned
-        .replace("-----BEGIN CERTIFICATE-----", "")
-        .replace("-----END CERTIFICATE-----", "")
-        .replace(['\r', '\n', '\t', ' '], "");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-    payload = payload.trim().to_string();
+    let pem_start_tag = "-----BEGIN CERTIFICATE-----";
+    let pem_end_tag = "-----END CERTIFICATE-----";
+    if let (Some(start_idx), Some(end_idx)) = (trimmed.find(pem_start_tag), trimmed.find(pem_end_tag)) {
+        let after_start = start_idx + pem_start_tag.len();
+        if end_idx > after_start {
+            let body = &trimmed[after_start..end_idx];
+            let payload = body.replace(['\r', '\n', '\t', ' '], "");
+            if payload.is_empty() {
+                return None;
+            }
+            return STANDARD.decode(payload.as_bytes()).ok();
+        }
+    }
+
+    let payload = trimmed.replace(['\r', '\n', '\t', ' '], "");
     if payload.is_empty() {
         return None;
     }
@@ -843,14 +857,24 @@ fn parse_private_key_material(raw: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    if trimmed.contains("-----BEGIN") {
-        let normalized = trimmed
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Some(normalized.into_bytes());
+    if let Some(start_idx) = trimmed.find("-----BEGIN") {
+        if let Some(end_marker_rel) = trimmed[start_idx..].find("-----END") {
+            let end_marker_start = start_idx + end_marker_rel;
+            if let Some(line_end_rel) = trimmed[end_marker_start..].find("-----") {
+                let after_first_dashes = end_marker_start + line_end_rel + 5;
+                if let Some(final_dashes_rel) = trimmed[after_first_dashes..].find("-----") {
+                    let end_idx = after_first_dashes + final_dashes_rel + 5;
+                    let pem_block = &trimmed[start_idx..end_idx];
+                    let normalized = pem_block
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Some(normalized.into_bytes());
+                }
+            }
+        }
     }
 
     let payload = trimmed.replace(['\r', '\n', '\t', ' '], "");
@@ -934,7 +958,11 @@ fn parse_keybox_material_from_xml(xml: &str) -> Result<Vec<KeyboxMaterial>> {
         let mut certs = Vec::new();
         for cert_text in extract_tag_values(block, "Certificate") {
             if let Some(der) = pem_or_base64_to_der(cert_text) {
-                certs.push(der);
+                if certificate_public_key_family(&der).is_some() {
+                    certs.push(der);
+                } else {
+                    warn!("tee soft debug: dropped invalid/corrupted certificate DER in keybox");
+                }
             }
         }
         if certs.is_empty() {
