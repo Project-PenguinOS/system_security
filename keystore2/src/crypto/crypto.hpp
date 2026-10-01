@@ -153,6 +153,7 @@ int extractAttestationPatchLevels(const uint8_t* cert_buf, size_t cert_len, int3
 // challenge: attestation challenge bytes
 // signing_cert_buf, signing_cert_len: signer certificate (DER)
 // signing_key_buf, signing_key_len: signer private key (DER or PEM)
+// attest_app_id_buf, attest_app_id_len: caller AttestationApplicationId (DER)
 // is_attest_key: whether KeyPurpose::ATTEST_KEY is requested
 // out_privkey_buf, out_privkey_buf_len: buffer to receive PKCS#8 private key
 // out_privkey_len: written length of PKCS#8 private key
@@ -163,6 +164,7 @@ int generateSoftwareAttestedKey(
         const uint8_t* challenge, size_t challenge_len,
         const uint8_t* signing_cert_buf, size_t signing_cert_len,
         const uint8_t* signing_key_buf, size_t signing_key_len,
+        const uint8_t* attest_app_id_buf, size_t attest_app_id_len,
         int is_attest_key,
         uint8_t* out_privkey_buf, size_t out_privkey_buf_len,
         size_t* out_privkey_len,

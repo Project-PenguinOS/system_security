@@ -406,6 +406,17 @@ pub(crate) fn should_force_software_generation_for_uid(
     }
 }
 
+fn attestation_application_id(params: &[KeyParameter]) -> &[u8] {
+    params
+        .iter()
+        .find(|p| p.tag == Tag::ATTESTATION_APPLICATION_ID)
+        .and_then(|p| match &p.value {
+            KeyParameterValue::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
 pub(crate) fn generate_software_key_for_uid(
     caller_uid: AppUid,
     creation_params: &[KeyParameter],
@@ -491,6 +502,7 @@ pub(crate) fn generate_software_key_for_uid(
         challenge,
         signing_cert,
         signing_key,
+        attestation_application_id(creation_params),
         is_attest_key,
     ) {
         Ok((privkey, cert)) => {
@@ -1691,6 +1703,7 @@ pub(crate) fn maybe_override_certificate_chain_for_uid(
                         challenge,
                         signing_cert,
                         signing_key,
+                        attestation_application_id(creation_params),
                         true,
                     ) {
                         Ok((privkey, cert)) => {
