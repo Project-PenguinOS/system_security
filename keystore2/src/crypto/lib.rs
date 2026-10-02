@@ -648,6 +648,7 @@ pub fn generate_software_attested_key(
     challenge: &[u8],
     signing_cert_buf: &[u8],
     signing_key_buf: &[u8],
+    attest_app_id: &[u8],
     is_attest_key: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let mut privkey_buf = vec![0u8; 4096];
@@ -666,6 +667,8 @@ pub fn generate_software_attested_key(
             signing_cert_buf.len(),
             signing_key_buf.as_ptr(),
             signing_key_buf.len(),
+            attest_app_id.as_ptr(),
+            attest_app_id.len(),
             if is_attest_key { 1 } else { 0 },
             privkey_buf.as_mut_ptr(),
             privkey_buf.len(),
@@ -693,6 +696,8 @@ pub fn generate_software_attested_key(
                 signing_cert_buf.len(),
                 signing_key_buf.as_ptr(),
                 signing_key_buf.len(),
+                attest_app_id.as_ptr(),
+                attest_app_id.len(),
                 if is_attest_key { 1 } else { 0 },
                 privkey_buf.as_mut_ptr(),
                 privkey_buf.len(),

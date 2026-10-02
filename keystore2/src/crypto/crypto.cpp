@@ -39,6 +39,8 @@
 #include <openssl/sha.h>
 #include <openssl/x509.h>
 
+#include <cstdio>
+#include <ctime>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -759,6 +761,30 @@ static std::vector<uint8_t> makeExplicitContextTlv(uint32_t tag_no, const std::v
     return out;
 }
 
+static std::vector<uint8_t> makeDerInteger(uint64_t value) {
+    std::vector<uint8_t> bytes;
+    do {
+        bytes.insert(bytes.begin(), static_cast<uint8_t>(value & 0xFF));
+        value >>= 8;
+    } while (value != 0);
+    if (bytes[0] & 0x80) bytes.insert(bytes.begin(), 0x00);
+    return makeDerTlv(0x02, bytes);
+}
+
+static uint32_t osVersionFromProperty() {
+    const std::string release = android::base::GetProperty("ro.build.version.release", "");
+    int major = 0, minor = 0, sub = 0;
+    if (sscanf(release.c_str(), "%d.%d.%d", &major, &minor, &sub) < 1) return 0;
+    return major * 10000 + minor * 100 + sub;
+}
+
+static uint32_t patchLevelFromProperty(bool with_day) {
+    const std::string patch = android::base::GetProperty("ro.build.version.security_patch", "");
+    int year = 0, month = 0, day = 0;
+    if (sscanf(patch.c_str(), "%d-%d-%d", &year, &month, &day) != 3) return 0;
+    return with_day ? year * 10000 + month * 100 + day : year * 100 + month;
+}
+
 static constexpr const char* kHarvestFile = "/data/system/keystore_compat/harvested.json";
 static constexpr const char* kLegacyHarvestFile = "/data/system/tee_simulator/harvested.json";
 
@@ -1365,6 +1391,7 @@ int generateSoftwareAttestedKey(
         const uint8_t* challenge, size_t challenge_len,
         const uint8_t* signing_cert_buf, size_t signing_cert_len,
         const uint8_t* signing_key_buf, size_t signing_key_len,
+        const uint8_t* attest_app_id_buf, size_t attest_app_id_len,
         int is_attest_key,
         uint8_t* out_privkey_buf, size_t out_privkey_buf_len,
         size_t* out_privkey_len,
@@ -1497,6 +1524,11 @@ int generateSoftwareAttestedKey(
     auto tag5 = makeExplicitContextTlv(5, dig_set);
     tee_items.insert(tee_items.end(), tag5.begin(), tag5.end());
 
+    if (key_algorithm_val == 3) {
+        auto tag10 = makeExplicitContextTlv(10, makeDerInteger(1));
+        tee_items.insert(tee_items.end(), tag10.begin(), tag10.end());
+    }
+
     std::vector<uint8_t> null_val = {0x05, 0x00};
     auto tag503 = makeExplicitContextTlv(503, null_val);
     tee_items.insert(tee_items.end(), tag503.begin(), tag503.end());
@@ -1508,13 +1540,17 @@ int generateSoftwareAttestedKey(
     auto tag704 = makeExplicitContextTlv(704, rot_seq);
     tee_items.insert(tee_items.end(), tag704.begin(), tag704.end());
 
-    std::vector<uint8_t> os_ver_val = {0x02, 0x03, 0x02, 0x71, 0x00};
-    auto tag705 = makeExplicitContextTlv(705, os_ver_val);
+    auto tag705 = makeExplicitContextTlv(705, makeDerInteger(osVersionFromProperty()));
     tee_items.insert(tee_items.end(), tag705.begin(), tag705.end());
 
-    std::vector<uint8_t> os_patch_val = {0x02, 0x03, 0x03, 0x17, 0x6E};
-    auto tag706 = makeExplicitContextTlv(706, os_patch_val);
+    auto tag706 = makeExplicitContextTlv(706, makeDerInteger(patchLevelFromProperty(false)));
     tee_items.insert(tee_items.end(), tag706.begin(), tag706.end());
+
+    const std::vector<uint8_t> patch_with_day = makeDerInteger(patchLevelFromProperty(true));
+    auto tag718 = makeExplicitContextTlv(718, patch_with_day);
+    tee_items.insert(tee_items.end(), tag718.begin(), tag718.end());
+    auto tag719 = makeExplicitContextTlv(719, patch_with_day);
+    tee_items.insert(tee_items.end(), tag719.begin(), tag719.end());
 
     std::vector<uint8_t> tee_enforced_seq = makeDerTlv(0x30, tee_items);
 
@@ -1525,7 +1561,17 @@ int generateSoftwareAttestedKey(
     const std::vector<uint8_t> km_sec = {0x0A, 0x01, 0x01};
     std::vector<uint8_t> chal_oct = makeDerTlv(0x04, std::vector<uint8_t>(challenge, challenge + challenge_len));
     const std::vector<uint8_t> uniq_id = {0x04, 0x00};
-    const std::vector<uint8_t> sw_enforced = {0x30, 0x00};
+    std::vector<uint8_t> sw_items;
+    const uint64_t now_ms = static_cast<uint64_t>(time(nullptr)) * 1000;
+    auto tag701 = makeExplicitContextTlv(701, makeDerInteger(now_ms));
+    sw_items.insert(sw_items.end(), tag701.begin(), tag701.end());
+    if (attest_app_id_buf && attest_app_id_len > 0) {
+        auto tag709 = makeExplicitContextTlv(
+                709, makeDerTlv(0x04, std::vector<uint8_t>(attest_app_id_buf,
+                                                           attest_app_id_buf + attest_app_id_len)));
+        sw_items.insert(sw_items.end(), tag709.begin(), tag709.end());
+    }
+    const std::vector<uint8_t> sw_enforced = makeDerTlv(0x30, sw_items);
 
     kd_items.insert(kd_items.end(), att_ver.begin(), att_ver.end());
     kd_items.insert(kd_items.end(), att_sec.begin(), att_sec.end());
